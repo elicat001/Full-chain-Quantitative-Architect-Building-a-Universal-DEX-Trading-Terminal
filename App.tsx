@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   BookOpen, 
   Cpu, 
@@ -6,7 +6,6 @@ import {
   Code, 
   PlayCircle, 
   AlertTriangle, 
-  TrendingUp, 
   Activity, 
   Server, 
   DollarSign, 
@@ -16,7 +15,8 @@ import {
   RefreshCcw,
   Settings,
   BarChart3,
-  Network
+  Network,
+  ShieldAlert
 } from 'lucide-react';
 import { 
   LineChart, 
@@ -26,11 +26,8 @@ import {
   CartesianGrid, 
   Tooltip, 
   ResponsiveContainer, 
-  ReferenceLine,
-  Area,
-  AreaChart
 } from 'recharts';
-import { Phase, MarketState, SimulationStats } from './types';
+import { Phase, SimulationStats } from './types';
 
 // --- Components ---
 
@@ -82,7 +79,7 @@ const CodeBlock = ({ code, language = 'rust' }: { code: string; language?: strin
         <div className="w-2 h-2 rounded-full bg-hl-green/50"></div>
       </div>
     </div>
-    <pre className="p-4 overflow-x-auto text-sm font-mono text-gray-300">
+    <pre className="p-4 overflow-x-auto text-sm font-mono text-gray-300 scrollbar-thin scrollbar-thumb-hl-border scrollbar-track-transparent">
       <code>{code}</code>
     </pre>
   </div>
@@ -90,46 +87,91 @@ const CodeBlock = ({ code, language = 'rust' }: { code: string; language?: strin
 
 // --- Logic & Data ---
 
-const RUST_CODE_SNIPPET = `// Hyperliquid 高频策略核心循环 (Rust)
+const RUST_PRODUCTION_CODE = `// Hyperliquid HFT Core Engine (Rust)
+// 生产环境架构标准示例 v1.0
 
-use tokio_tungstenite::connect_async;
-use serde_json::Value;
+use tokio::net::TcpStream;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use futures_util::{StreamExt, SinkExt};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::Mutex; // 在极高频场景推荐使用 crossbeam 或无锁队列
+use std::time::{Duration, Instant};
+
+// 定义 L2 订单簿数据结构 (Simd-Json 友好)
+#[derive(Debug, Deserialize)]
+struct L2Book {
+    coin: String,
+    levels: Vec<Vec<String>>, // [price, size] - 解析为字符串防止精度丢失
+    time: u64,
+}
+
+#[derive(Debug, Clone)]
+struct StrategyState {
+    inventory: f64,    // 当前持仓 (ETH)
+    cash: f64,         // 可用资金 (USDC)
+    active_orders: Vec<String>, // 活跃订单 ID
+}
 
 #[tokio::main]
 async fn main() {
-    // 1. 建立低延迟 WebSocket 连接
-    let (ws_stream, _) = connect_async("wss://api.hyperliquid.xyz/ws").await.unwrap();
+    // 1. 初始化高性能日志 (带微秒时间戳)
+    env_logger::builder().format_timestamp_micros().init();
+
+    // 2. 建立 WebSocket 连接 (Hyperliquid Mainnet)
+    let url = "wss://api.hyperliquid.xyz/ws";
+    let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
     let (mut write, mut read) = ws_stream.split();
+    println!("✅ Connected to Hyperliquid WebSocket Feed");
 
-    // 2. 订阅 L2 订单簿 (只关注最近的档位以减少带宽)
-    let sub_msg = json!({ "method": "subscribe", "subscription": { "type": "l2Book", "coin": "ETH" } });
-    write.send(Message::Text(sub_msg.to_string())).await.unwrap();
+    // 3. 订阅核心频道 (L2 Book & User Fills)
+    // "nTrades" 用于流式成交计算，"l2Book" 用于深度计算
+    let sub_msg = r#"{ "method": "subscribe", "subscription": { "type": "l2Book", "coin": "ETH" } }"#;
+    write.send(sub_msg.into()).await.expect("Failed to subscribe");
 
-    // 3. 极速事件循环
-    while let Some(message) = read.next().await {
-        let data = parse_simd_json(message); // 使用 SIMD 加速解析
-        
-        // 4. 策略逻辑：Avellaneda-Stoikov 模型
-        let mid_price = (data.bids[0].px + data.asks[0].px) / 2.0;
-        let inventory = account.get_position("ETH");
-        
-        // 核心：计算保留价格 (Reservation Price)
-        // r = s - q * gamma * sigma^2
-        let reservation_price = mid_price - (inventory * RISK_AVERSION * VOLATILITY);
-        
-        let spread = calculate_optimal_spread(VOLATILITY);
-        
-        let my_bid = reservation_price - spread / 2.0;
-        let my_ask = reservation_price + spread / 2.0;
+    // 4. 共享状态 (Hot State)
+    let state = Arc::new(Mutex::new(StrategyState {
+        inventory: 0.0,
+        cash: 10000.0,
+        active_orders: vec![],
+    }));
 
-        // 5. 差分下单 (只在价格变动超过阈值时修改订单，节省 API 限频)
-        if (my_bid - current_bid).abs() > TICK_SIZE {
-             api_client.post_orders(vec![
-                 Order { coin: "ETH", is_buy: true, sz: 1.0, limit_px: my_bid },
-                 Order { coin: "ETH", is_buy: false, sz: 1.0, limit_px: my_ask }
-             ]).await;
+    println!("🚀 HFT Engine Started. Listening for ticks...");
+
+    // 5. 极速事件循环 (Hot Path Loop)
+    while let Some(msg) = read.next().await {
+        // 延迟监控点 A
+        let start = Instant::now(); 
+        
+        match msg {
+            Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                // 解析阶段 (关键路径: 使用 simd-json 优化性能)
+                // let book: L2Book = simd_json::from_str(&text).unwrap();
+                
+                // 这里的逻辑必须在 <50us 内完成以保持竞争力
+                process_tick(&text, state.clone()).await;
+            },
+            Ok(tokio_tungstenite::tungstenite::Message::Ping(_)) => {
+                // 自动处理 Ping/Pong 保持连接存活
+            },
+            Err(e) => eprintln!("WS Error: {:?}", e),
+            _ => {}
+        }
+
+        // 延迟监控点 B: 如果处理耗时超过 100us，发出警告
+        if start.elapsed().as_micros() > 100 {
+             eprintln!("⚠️ Slow Tick Warning: {}us", start.elapsed().as_micros());
         }
     }
+}
+
+// 核心策略逻辑
+async fn process_tick(data: &str, state: Arc<Mutex<StrategyState>>) {
+    // 1. 解析行情
+    // 2. 更新本地 Orderbook 状态
+    // 3. 计算 Avellaneda-Stoikov 指标 (Reservation Price)
+    // 4. 风险检查 (Risk Check)
+    // 5. 异步发送下单请求 (Reqwest / Hyper)
 }`;
 
 // --- Simulation Types ---
@@ -155,7 +197,6 @@ const App: React.FC = () => {
   const [simRunning, setSimRunning] = useState(false);
   const [riskAversion, setRiskAversion] = useState(0.1); // Gamma
   const [volatility, setVolatility] = useState(0.5); // Sigma
-  const [latency, setLatency] = useState(20); // Simulated ms
   
   // Simulation State
   const [simState, setSimState] = useState<SimState>({
@@ -180,34 +221,29 @@ const App: React.FC = () => {
           const time = Date.now();
           
           // 1. Market Dynamics: Geometric Brownian Motion
-          const dt = 1/365/24/60/60; // small time step
-          const drift = 0;
-          const shock = (Math.random() - 0.5) * volatility * 2; // Simple volatility
+          const shock = (Math.random() - 0.5) * volatility * 2; 
           const newMid = prev.midPrice + shock;
           
           // 2. Strategy: Calculate Reservation Price (r)
           // r = s - q * gamma * sigma^2
-          // If inventory > 0, r < s (Skew quotes down to sell)
-          // If inventory < 0, r > s (Skew quotes up to buy)
-          const inventorySkew = prev.inventory * riskAversion * volatility * 5; // Multiplier for visual effect
+          const inventorySkew = prev.inventory * riskAversion * volatility * 5; 
           const newReservation = newMid - inventorySkew;
           
           // 3. Calculate Optimal Quotes
-          const halfSpread = volatility * 0.8; // Simplified optimal spread
+          const halfSpread = volatility * 0.8; 
           const newBid = newReservation - halfSpread;
           const newAsk = newReservation + halfSpread;
           
           // 4. Matching Engine Simulation (Poisson Process)
-          // Probability of fill decays exponentially with distance from mid price
-          const probHitAsk = Math.exp(-1.5 * (newAsk - newMid)); // Ask hit if price moves up
-          const probHitBid = Math.exp(-1.5 * (newMid - newBid)); // Bid hit if price moves down
+          const probHitAsk = Math.exp(-1.5 * (newAsk - newMid)); 
+          const probHitBid = Math.exp(-1.5 * (newMid - newBid)); 
           
           let nextInv = prev.inventory;
           let nextCash = prev.cash;
           let tradeOccurred = false;
 
           // Simulate Ask Fill
-          if (Math.random() < probHitAsk * 0.3) { // 0.3 factor to slow down visual sim
+          if (Math.random() < probHitAsk * 0.3) { 
               nextInv -= 1;
               nextCash += newAsk;
               tradeOccurred = true;
@@ -256,7 +292,7 @@ const App: React.FC = () => {
               myAsk: newAsk
           };
         });
-      }, 50); // 50ms Tick
+      }, 50); 
     }
     return () => clearInterval(interval);
   }, [simRunning, riskAversion, volatility]);
@@ -267,48 +303,40 @@ const App: React.FC = () => {
         return (
           <div className="animate-fade-in">
             <div className="mb-8">
-              <h1 className="text-3xl font-bold text-white mb-2">高频做市 (HFT Market Making)</h1>
-              <p className="text-gray-400">在毫秒级的战场上，理解微观结构比预测大趋势更重要。</p>
+              <h1 className="text-3xl font-bold text-white mb-2">Rust 高频策略基础</h1>
+              <p className="text-gray-400">为什么在 Hyperliquid 这样的高性能链上交易所，Rust 是唯一选择？</p>
             </div>
             
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              <ContentCard title="做市商的核心任务">
+              <ContentCard title="技术优势">
                 <ul className="space-y-4 text-sm text-gray-300">
                   <li className="flex items-start">
-                    <span className="text-hl-green mr-2">1.</span>
-                    <span><strong>提供流动性：</strong>在买一和卖一挂单，赚取点差 (Spread)。</span>
+                    <Zap className="text-hl-green mr-2 shrink-0" size={18} />
+                    <span><strong>零成本抽象 (Zero-cost Abstractions)：</strong> Rust 让你在写高级代码的同时，编译出汇编级的机器码。</span>
                   </li>
                   <li className="flex items-start">
-                    <span className="text-hl-green mr-2">2.</span>
-                    <span><strong>库存管理 (核心)：</strong>你不是在赌方向。如果你积累了太多多头头寸，你必须降低卖单价格以尽快平仓。这叫 <span className="text-hl-accent">Inventory Skewing</span>。</span>
+                    <ShieldAlert className="text-hl-green mr-2 shrink-0" size={18} />
+                    <span><strong>内存安全 (Memory Safety)：</strong> HFT 系统需要 7x24 运行。C++ 常见的段错误 (Segfaults) 在 Rust 中几乎绝迹。</span>
                   </li>
                   <li className="flex items-start">
-                    <span className="text-hl-green mr-2">3.</span>
-                    <span><strong>逆向选择 (Adverse Selection)：</strong>如果你的买单被“有毒流”(Toxic Flow) 吃掉，通常意味着价格即将暴跌。你必须比这种信息跑得更快。</span>
+                    <Cpu className="text-hl-green mr-2 shrink-0" size={18} />
+                    <span><strong>无 GC (No Garbage Collection)：</strong> Java 和 Go 的垃圾回收会造成毫秒级的停顿 (STW)，这在高频交易中是致命的。Rust 像 C++ 一样手动管理内存，但更安全。</span>
                   </li>
                 </ul>
               </ContentCard>
 
-              <ContentCard title="订单簿微观结构">
-                 <div className="relative h-40 bg-[#0d0e11] rounded border border-hl-border flex items-center justify-center overflow-hidden">
-                    <div className="absolute w-full h-full flex">
-                        <div className="w-1/2 h-full flex flex-col items-end justify-center pr-4 border-r border-dashed border-gray-700">
-                            <div className="text-hl-green font-mono">Buy Orders</div>
-                            <div className="w-3/4 h-2 bg-hl-green/20 mt-1 rounded"></div>
-                            <div className="w-1/2 h-2 bg-hl-green/20 mt-1 rounded"></div>
-                            <div className="w-full h-2 bg-hl-green/20 mt-1 rounded"></div>
-                        </div>
-                        <div className="w-1/2 h-full flex flex-col items-start justify-center pl-4">
-                            <div className="text-hl-red font-mono">Sell Orders</div>
-                            <div className="w-2/3 h-2 bg-hl-red/20 mt-1 rounded"></div>
-                            <div className="w-1/2 h-2 bg-hl-red/20 mt-1 rounded"></div>
-                            <div className="w-full h-2 bg-hl-red/20 mt-1 rounded"></div>
-                        </div>
-                    </div>
-                    <div className="z-10 bg-[#141519] px-4 py-2 rounded border border-hl-border text-xs font-mono">
-                        Spread (点差)
-                    </div>
-                 </div>
+              <ContentCard title="Hyperliquid 特性">
+                <div className="space-y-4 text-sm text-gray-300">
+                  <p>Hyperliquid 是基于 HyperBFT 共识构建的 L1 链，这意味着：</p>
+                  <div className="bg-[#0d0e11] p-3 rounded border border-hl-border">
+                    <span className="text-hl-accent font-bold">Block Latency:</span> &lt; 200ms<br/>
+                    <span className="text-hl-blue font-bold">API Limit:</span> 1200 requests/min (IP based)<br/>
+                    <span className="text-hl-green font-bold">Tech Stack:</span> 整个交易所后端也是用 Rust 编写的。
+                  </div>
+                  <p className="text-xs text-gray-400">
+                    使用 Rust 客户端意味着你可以复用部分官方 SDK 的逻辑，并获得最佳的序列化/反序列化性能。
+                  </p>
+                </div>
               </ContentCard>
             </div>
           </div>
@@ -318,72 +346,49 @@ const App: React.FC = () => {
         return (
           <div className="animate-fade-in">
             <div className="mb-8">
-              <h1 className="text-3xl font-bold text-white mb-2">极致性能技术栈</h1>
-              <p className="text-gray-400">当竞争对手是 Jump Trading 和 Wintermute 时，Python 是不够的。</p>
+              <h1 className="text-3xl font-bold text-white mb-2">Rust 生产级工具链</h1>
+              <p className="text-gray-400">抛弃 Python，以下是构建真实盈利机器人的核心依赖库。</p>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-              <div className="bg-hl-card border border-hl-green/30 rounded-xl p-6 relative overflow-hidden group">
-                <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
-                  <Cpu size={100} />
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+              <ContentCard title="核心 Crates (依赖库)">
+                <div className="space-y-4">
+                   <div className="flex justify-between items-center border-b border-gray-800 pb-2">
+                      <span className="font-mono text-hl-green font-bold">tokio</span>
+                      <span className="text-xs text-gray-500">异步运行时 (The Runtime)</span>
+                   </div>
+                   <div className="flex justify-between items-center border-b border-gray-800 pb-2">
+                      <span className="font-mono text-hl-green font-bold">tungstenite</span>
+                      <span className="text-xs text-gray-500">WebSocket 客户端</span>
+                   </div>
+                   <div className="flex justify-between items-center border-b border-gray-800 pb-2">
+                      <span className="font-mono text-hl-green font-bold">simd-json</span>
+                      <span className="text-xs text-gray-500">利用 CPU 指令集加速 JSON 解析</span>
+                   </div>
+                   <div className="flex justify-between items-center border-b border-gray-800 pb-2">
+                      <span className="font-mono text-hl-green font-bold">reqwest</span>
+                      <span className="text-xs text-gray-500">HTTP 客户端 (用于非实时操作)</span>
+                   </div>
                 </div>
-                <h3 className="text-xl font-bold text-hl-green mb-2">Rust</h3>
-                <div className="text-xs font-mono bg-hl-green/10 text-hl-green inline-block px-2 py-1 rounded mb-4">硬性要求</div>
-                <p className="text-sm text-gray-400">
-                  无 GC (垃圾回收) 暂停。内存安全。现代金融系统的首选。Hyperliquid 的后端本身也是用 Rust 写的。
-                </p>
-              </div>
+              </ContentCard>
 
-              <div className="bg-hl-card border border-hl-border rounded-xl p-6 opacity-75">
-                <h3 className="text-xl font-bold text-white mb-2">C++</h3>
-                <div className="text-xs font-mono bg-gray-700 text-gray-300 inline-block px-2 py-1 rounded mb-4">传统选择</div>
-                <p className="text-sm text-gray-400">
-                  如果你有现成的 C++ 库可以使用。但对于新项目，Rust 的开发效率和安全性更高。
-                </p>
-              </div>
-              
-              <div className="bg-hl-card border border-hl-red/30 rounded-xl p-6 opacity-60">
-                <h3 className="text-xl font-bold text-white mb-2">Python</h3>
-                <div className="text-xs font-mono bg-hl-red/10 text-hl-red inline-block px-2 py-1 rounded mb-4">仅用于研究</div>
-                <p className="text-sm text-gray-400">
-                  仅用于数据分析、回测和原型设计。由于 GIL 和解释器开销，无法处理微秒级做市。
-                </p>
-              </div>
+              <ContentCard title="性能调优 (Profiling)">
+                <div className="space-y-4">
+                   <div className="bg-[#0d0e11] p-4 rounded border border-hl-border">
+                     <h4 className="font-bold text-white mb-1 flex items-center"><Activity size={16} className="mr-2 text-hl-red"/> Flamegraph (火焰图)</h4>
+                     <p className="text-xs text-gray-400">
+                       使用 <code className="bg-gray-800 px-1">cargo flamegraph</code> 分析 CPU 热点。如果你发现 20% 的时间花在 JSON 解析上，就必须优化它。
+                     </p>
+                   </div>
+                   <div className="bg-[#0d0e11] p-4 rounded border border-hl-border">
+                     <h4 className="font-bold text-white mb-1 flex items-center"><Server size={16} className="mr-2 text-hl-blue"/> Criterion.rs</h4>
+                     <p className="text-xs text-gray-400">
+                       Rust 的微基准测试框架。在修改任何核心逻辑前，先写 benchmark 确保没有引入性能倒退。
+                     </p>
+                   </div>
+                </div>
+              </ContentCard>
             </div>
-
-            <ContentCard title="系统级调优 (System Tuning)">
-               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                 <div className="bg-[#0d0e11] p-4 rounded border border-hl-border">
-                   <div className="flex items-center mb-2 text-hl-blue">
-                      <Zap size={18} className="mr-2" />
-                      <span className="font-bold text-sm">Kernel Bypass</span>
-                   </div>
-                   <p className="text-xs text-gray-400 leading-relaxed">
-                     使用 DPDK 或 Solarflare OpenOnload。绕过操作系统笨重的 TCP/IP 协议栈，直接从网卡读取数据包。
-                   </p>
-                 </div>
-                 
-                 <div className="bg-[#0d0e11] p-4 rounded border border-hl-border">
-                   <div className="flex items-center mb-2 text-hl-blue">
-                      <Cpu size={18} className="mr-2" />
-                      <span className="font-bold text-sm">CPU Isolation</span>
-                   </div>
-                   <p className="text-xs text-gray-400 leading-relaxed">
-                     使用 <code className="bg-gray-800 px-1 rounded">isolcpus</code>。将策略线程“钉”在特定物理核心上，独占 L1/L2 缓存，防止上下文切换。
-                   </p>
-                 </div>
-
-                 <div className="bg-[#0d0e11] p-4 rounded border border-hl-border">
-                   <div className="flex items-center mb-2 text-hl-blue">
-                      <Code size={18} className="mr-2" />
-                      <span className="font-bold text-sm">SIMD JSON</span>
-                   </div>
-                   <p className="text-xs text-gray-400 leading-relaxed">
-                     使用 <code className="bg-gray-800 px-1 rounded">simd-json</code>。利用 CPU 的 AVX2 指令集并行解析 JSON 数据，解析速度提升 300%。
-                   </p>
-                 </div>
-               </div>
-            </ContentCard>
           </div>
         );
 
@@ -391,25 +396,31 @@ const App: React.FC = () => {
         return (
           <div className="animate-fade-in h-full flex flex-col">
             <div className="mb-6">
-              <h1 className="text-3xl font-bold text-white mb-2">核心代码架构</h1>
-              <p className="text-gray-400">基于 Toko 的异步事件驱动架构。</p>
+              <h1 className="text-3xl font-bold text-white mb-2">生产环境代码架构</h1>
+              <p className="text-gray-400">这是你启动 `cargo new hft_bot` 后应该编写的第一份代码。</p>
             </div>
 
             <div className="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-6">
               <div className="lg:col-span-2">
-                <CodeBlock code={RUST_CODE_SNIPPET} />
+                <CodeBlock code={RUST_PRODUCTION_CODE} />
               </div>
               <div className="space-y-4">
                 <div className="p-4 bg-hl-card border-l-2 border-hl-green rounded-r-lg">
-                  <h4 className="font-bold text-sm text-hl-green mb-1">事件循环 (Event Loop)</h4>
+                  <h4 className="font-bold text-sm text-hl-green mb-1">Simd-Json</h4>
                   <p className="text-xs text-gray-400">
-                    必须是单线程无锁的 (Single-threaded Lock-free)。锁 (Mutex) 会导致线程争用，引入不可控的延迟抖动。
+                    标准库的 `serde_json` 很好，但对于 HFT 来说太慢了。`simd-json` 利用 AVX2/SSE4.2 指令集，能将解析速度提升 2-3 倍。
                   </p>
                 </div>
                 <div className="p-4 bg-hl-card border-l-2 border-hl-blue rounded-r-lg">
-                  <h4 className="font-bold text-sm text-hl-blue mb-1">状态管理</h4>
+                  <h4 className="font-bold text-sm text-hl-blue mb-1">Arc &lt;Mutex&gt;</h4>
                   <p className="text-xs text-gray-400">
-                    在本地内存中完整重建订单簿 (Local Orderbook)。不要每次下单都去查询 API，直接使用本地状态计算。
+                    在演示代码中我们使用了 Mutex 锁。在极致优化场景下，应该使用 **Crossbeam Channels** 或 **Ring Buffer** 来在 WebSocket 线程和策略线程之间传递数据，实现无锁 (Lock-free) 通信。
+                  </p>
+                </div>
+                <div className="p-4 bg-hl-card border-l-2 border-hl-red rounded-r-lg">
+                  <h4 className="font-bold text-sm text-hl-red mb-1">Hot Path Warning</h4>
+                  <p className="text-xs text-gray-400">
+                    在 `process_tick` 函数中，绝对禁止进行任何 I/O 操作（如打印日志到文件、数据库写入）。这些操作必须异步分发到低优先级线程。
                   </p>
                 </div>
               </div>
@@ -422,8 +433,8 @@ const App: React.FC = () => {
           <div className="animate-fade-in h-full flex flex-col">
             <div className="flex justify-between items-center mb-6">
               <div>
-                <h1 className="text-3xl font-bold text-white mb-1">Stoikov 策略模拟器</h1>
-                <p className="text-gray-400 text-sm">深度观察：库存如何偏移保留价格 (Reservation Price)</p>
+                <h1 className="text-3xl font-bold text-white mb-1">Rust 策略逻辑可视化</h1>
+                <p className="text-gray-400 text-sm">这就是你的 Rust 代码在微秒级别执行的数学逻辑 (Avellaneda-Stoikov)。</p>
               </div>
               <div className="flex items-center space-x-4">
                  <div className="flex flex-col items-end mr-4">
@@ -458,8 +469,8 @@ const App: React.FC = () => {
               {/* Main Chart */}
               <div className="lg:col-span-2 bg-[#0d0e11] border border-hl-border rounded-xl p-4 flex flex-col relative">
                 <div className="absolute top-4 left-4 z-10 flex space-x-4 text-xs">
-                    <div className="flex items-center"><div className="w-3 h-1 bg-hl-blue mr-2"></div>Mid Price (中间价)</div>
-                    <div className="flex items-center"><div className="w-3 h-1 bg-hl-accent mr-2"></div>Reservation Price (保留价)</div>
+                    <div className="flex items-center"><div className="w-3 h-1 bg-hl-blue mr-2"></div>Mid Price</div>
+                    <div className="flex items-center"><div className="w-3 h-1 bg-hl-accent mr-2"></div>Reservation Price (r)</div>
                     <div className="flex items-center"><div className="w-3 h-1 bg-hl-green mr-2"></div>My Bid</div>
                     <div className="flex items-center"><div className="w-3 h-1 bg-hl-red mr-2"></div>My Ask</div>
                 </div>
@@ -475,13 +486,8 @@ const App: React.FC = () => {
                         labelStyle={{ display: 'none' }}
                         formatter={(value: any) => parseFloat(value).toFixed(2)}
                       />
-                      {/* Market Mid Price */}
                       <Line type="monotone" dataKey="price" stroke="#3b82f6" strokeWidth={2} dot={false} />
-                      
-                      {/* Strategy Reservation Price - The "Soul" of the bot */}
                       <Line type="step" dataKey="reservation" stroke="#8b5cf6" strokeWidth={2} strokeDasharray="5 5" dot={false} />
-                      
-                      {/* Quotes */}
                       <Line type="step" dataKey="bid" stroke="#2ebd85" strokeWidth={1} dot={false} opacity={0.6} />
                       <Line type="step" dataKey="ask" stroke="#f6465d" strokeWidth={1} dot={false} opacity={0.6} />
                     </LineChart>
@@ -489,9 +495,8 @@ const App: React.FC = () => {
                 </div>
               </div>
 
-              {/* Control Panel & Internal State */}
+              {/* Control Panel */}
               <div className="space-y-6">
-                {/* Parameters */}
                 <div className="bg-hl-card border border-hl-border rounded-xl p-4">
                     <h4 className="text-xs font-bold text-gray-500 mb-4 uppercase flex items-center">
                         <Settings size={14} className="mr-2" /> 策略参数 (Strategy Params)
@@ -509,7 +514,6 @@ const App: React.FC = () => {
                                 onChange={(e) => setRiskAversion(parseFloat(e.target.value))}
                                 className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-hl-accent"
                             />
-                            <p className="text-[10px] text-gray-500 mt-1">值越大，库存稍微偏离 0 就会大幅调整报价。</p>
                         </div>
                         
                         <div>
@@ -523,48 +527,27 @@ const App: React.FC = () => {
                                 onChange={(e) => setVolatility(parseFloat(e.target.value))}
                                 className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-hl-blue"
                             />
-                            <p className="text-[10px] text-gray-500 mt-1">波动率越大，点差越宽。</p>
                         </div>
                     </div>
                 </div>
 
-                {/* Live Internals Visualizer */}
                 <div className="bg-hl-card border border-hl-border rounded-xl p-4">
                    <h4 className="text-xs font-bold text-gray-500 mb-3 uppercase flex items-center">
-                       <Activity size={14} className="mr-2" /> 内部状态 (Internals)
+                       <Activity size={14} className="mr-2" /> 实时状态 (Real-time State)
                    </h4>
                    
                    <div className="grid grid-cols-2 gap-4 mb-4">
                        <div className="bg-[#0d0e11] p-2 rounded border border-hl-border text-center">
-                           <div className="text-[10px] text-gray-500">Inventory</div>
+                           <div className="text-[10px] text-gray-500">Inventory (ETH)</div>
                            <div className={`text-lg font-mono font-bold ${simState.inventory === 0 ? 'text-gray-300' : simState.inventory > 0 ? 'text-hl-green' : 'text-hl-red'}`}>
                                {simState.inventory}
                            </div>
                        </div>
                        <div className="bg-[#0d0e11] p-2 rounded border border-hl-border text-center">
-                           <div className="text-[10px] text-gray-500">Skew</div>
+                           <div className="text-[10px] text-gray-500">Price Skew</div>
                            <div className="text-lg font-mono font-bold text-hl-accent">
                                {(simState.reservationPrice - simState.midPrice).toFixed(2)}
                            </div>
-                       </div>
-                   </div>
-
-                   <div className="space-y-2 text-xs font-mono">
-                       <div className="flex justify-between">
-                           <span className="text-hl-red">My Ask</span>
-                           <span>{simState.myAsk.toFixed(2)}</span>
-                       </div>
-                       <div className="flex justify-between font-bold">
-                           <span className="text-hl-accent">Reservation</span>
-                           <span>{simState.reservationPrice.toFixed(2)}</span>
-                       </div>
-                       <div className="flex justify-between text-gray-500">
-                           <span>Mid Price</span>
-                           <span>{simState.midPrice.toFixed(2)}</span>
-                       </div>
-                       <div className="flex justify-between">
-                           <span className="text-hl-green">My Bid</span>
-                           <span>{simState.myBid.toFixed(2)}</span>
                        </div>
                    </div>
                 </div>
@@ -577,16 +560,16 @@ const App: React.FC = () => {
         return (
           <div className="animate-fade-in">
              <div className="mb-8">
-              <h1 className="text-3xl font-bold text-white mb-2">阶段五：基础设施与实战</h1>
-              <p className="text-gray-400">当你拥有了完美的策略代码，接下来就是“拼硬件”。</p>
+              <h1 className="text-3xl font-bold text-white mb-2">实战部署检查清单</h1>
+              <p className="text-gray-400">代码写好后，如何部署才能确保你的 Rust 程序跑得飞快？</p>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
                 {[
-                    { icon: Server, title: "裸金属服务器", cost: "$800+/月", desc: "独占 CPU 资源，无虚拟化噪音。" },
-                    { icon: Network, title: "主机托管 (Colo)", cost: "$5000+/月", desc: "服务器放在交易所机房隔壁，光纤直连。" },
-                    { icon: BarChart3, title: "L3 数据源", cost: "$2000+/月", desc: "购买逐笔成交数据用于回测。" },
-                    { icon: DollarSign, title: "最低资金", cost: "$10,000+", desc: "HFT 需要一定的资本厚度来承受回撤。" },
+                    { icon: Server, title: "AWS Local Zones", cost: "Latency < 1ms", desc: "必须选择离交易所最近的节点 (通常是 Tokyo 或 Virginia)。" },
+                    { icon: Network, title: "专线网络", cost: "Direct Connect", desc: "确保你的网络包不走公网路由，而是走优化的金融专线。" },
+                    { icon: BarChart3, title: "日志分级", cost: "Zero Overhead", desc: "生产环境只记录 ERROR 级别日志。Debug 日志会拖慢 I/O。" },
+                    { icon: DollarSign, title: "资金管理", cost: "Risk Limits", desc: "在代码中硬编码 Max Position 限制，防止算法故障导致爆仓。" },
                 ].map((item, idx) => (
                     <div key={idx} className="bg-hl-card border border-hl-border p-6 rounded-xl flex flex-col items-center text-center hover:border-hl-green/50 transition-colors">
                         <item.icon className="text-hl-green mb-4" size={32} />
@@ -597,21 +580,17 @@ const App: React.FC = () => {
                 ))}
             </div>
 
-            <ContentCard title="为什么散户几乎不可能成功？">
+            <ContentCard title="安全警示：私钥管理">
                 <div className="space-y-4">
                   <div className="flex items-start space-x-4 bg-hl-red/10 p-4 rounded-lg border border-hl-red/20">
                     <AlertTriangle className="text-hl-red shrink-0 mt-1" />
                     <div>
-                      <h4 className="text-hl-red font-bold mb-1 text-sm">延迟的马太效应</h4>
+                      <h4 className="text-hl-red font-bold mb-1 text-sm">绝对不要在代码中硬编码私钥</h4>
                       <p className="text-xs text-gray-300">
-                        这是一个“赢家通吃”的游戏。如果你比竞争对手慢 1 毫秒，你永远抢不到好的单子，却总是会接到“有毒”的单子（即别人知道价格要变了，赶紧卖给你，你还没反应过来）。
+                        Rust 程序在启动时应通过环境变量 (ENV VAR) 或专门的密钥管理服务 (AWS KMS) 读取私钥。编译后的二进制文件如果包含私钥字符串，可以被反编译窃取。
                       </p>
                     </div>
                   </div>
-                  
-                  <p className="text-sm text-gray-400 leading-relaxed">
-                    即使在 Hyperliquid 这样的高性能 DEX，你也面临着与 Wintermute、Jump 等顶级做市商的竞争。他们拥有更低的费率等级（Maker Rebates），这不仅是成本优势，更是生存优势。
-                  </p>
                 </div>
             </ContentCard>
           </div>
@@ -631,43 +610,43 @@ const App: React.FC = () => {
             <Activity className="text-hl-green" size={24} />
           </div>
           <div>
-            <h1 className="text-white font-bold tracking-tight">HFT Master</h1>
-            <div className="text-[10px] text-gray-500 uppercase tracking-widest">Hyperliquid 做市指南</div>
+            <h1 className="text-white font-bold tracking-tight">Rust HFT</h1>
+            <div className="text-[10px] text-gray-500 uppercase tracking-widest">Hyperliquid 架构师</div>
           </div>
         </div>
 
         <nav className="flex-1 p-4 overflow-y-auto">
-          <div className="text-xs font-bold text-gray-600 uppercase tracking-wider mb-4 px-3">课程大纲</div>
+          <div className="text-xs font-bold text-gray-600 uppercase tracking-wider mb-4 px-3">理论与工具</div>
           <NavItem 
             active={activePhase === Phase.Theory} 
             onClick={() => setActivePhase(Phase.Theory)} 
             icon={BookOpen} 
-            label="1. 核心概念" 
+            label="1. Rust 核心优势" 
             phase={Phase.Theory}
           />
            <NavItem 
             active={activePhase === Phase.Stack} 
             onClick={() => setActivePhase(Phase.Stack)} 
             icon={Layers} 
-            label="2. 技术栈选型" 
+            label="2. 生产级 Crates" 
             phase={Phase.Stack}
           />
           <NavItem 
             active={activePhase === Phase.Code} 
             onClick={() => setActivePhase(Phase.Code)} 
             icon={Code} 
-            label="3. 代码架构" 
+            label="3. 代码脚手架" 
             phase={Phase.Code}
           />
           
           <div className="my-4 border-t border-hl-border"></div>
           
-          <div className="text-xs font-bold text-gray-600 uppercase tracking-wider mb-4 px-3">实验室</div>
+          <div className="text-xs font-bold text-gray-600 uppercase tracking-wider mb-4 px-3">核心逻辑</div>
           <NavItem 
             active={activePhase === Phase.Simulation} 
             onClick={() => setActivePhase(Phase.Simulation)} 
             icon={Terminal} 
-            label="策略模拟器" 
+            label="策略模拟 (Stoikov)" 
             phase={Phase.Simulation}
           />
           
@@ -676,8 +655,8 @@ const App: React.FC = () => {
           <NavItem 
             active={activePhase === Phase.Reality} 
             onClick={() => setActivePhase(Phase.Reality)} 
-            icon={AlertTriangle} 
-            label="实战与成本" 
+            icon={Server} 
+            label="部署与实战" 
             phase={Phase.Reality}
           />
         </nav>
