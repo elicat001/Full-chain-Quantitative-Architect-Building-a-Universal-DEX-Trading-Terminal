@@ -1,0 +1,5 @@
+{
+  "name": "全链量化架构师：构建通用 DEX 交易终端",
+  "description": "一个交互式教育平台，指导用户构建能够接入 Hyperliquid, dYdX, Uniswap 等多类去中心化交易所的通用高频交易架构。",
+  "requestFramePermissions": []
+}
