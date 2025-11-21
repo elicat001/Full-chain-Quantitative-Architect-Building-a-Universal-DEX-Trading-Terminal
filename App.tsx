@@ -10,16 +10,13 @@ import {
   Activity, 
   Server, 
   DollarSign, 
-  ShieldAlert,
+  Zap,
   Terminal,
-  ChevronRight,
   PauseCircle,
   RefreshCcw,
-  Zap,
-  Lock,
-  Globe,
-  Network,
-  Workflow
+  Settings,
+  BarChart3,
+  Network
 } from 'lucide-react';
 import { 
   LineChart, 
@@ -29,9 +26,11 @@ import {
   CartesianGrid, 
   Tooltip, 
   ResponsiveContainer, 
-  ReferenceLine 
+  ReferenceLine,
+  Area,
+  AreaChart
 } from 'recharts';
-import { Phase, Order, MarketState, SimulationStats } from './types';
+import { Phase, MarketState, SimulationStats } from './types';
 
 // --- Components ---
 
@@ -52,7 +51,7 @@ const NavItem = ({
     onClick={onClick}
     className={`flex items-center w-full p-3 mb-2 rounded-lg transition-all duration-200 ${
       active 
-        ? 'bg-hl-accent/10 text-hl-accent border-l-4 border-hl-accent' 
+        ? 'bg-hl-green/10 text-hl-green border-l-4 border-hl-green' 
         : 'text-gray-400 hover:bg-hl-card hover:text-white'
     }`}
   >
@@ -64,7 +63,7 @@ const NavItem = ({
 const ContentCard = ({ title, children, className = "" }: { title: string, children?: React.ReactNode, className?: string }) => (
   <div className={`bg-hl-card border border-hl-border rounded-xl p-6 mb-6 ${className}`}>
     <h3 className="text-xl font-bold text-white mb-4 flex items-center">
-      <span className="bg-gradient-to-r from-hl-blue to-hl-accent w-2 h-6 mr-3 rounded-sm"></span>
+      <span className="bg-gradient-to-r from-hl-green to-hl-blue w-2 h-6 mr-3 rounded-sm"></span>
       {title}
     </h3>
     <div className="text-gray-300 leading-relaxed space-y-4">
@@ -91,114 +90,176 @@ const CodeBlock = ({ code, language = 'rust' }: { code: string; language?: strin
 
 // --- Logic & Data ---
 
-const RUST_CODE_SNIPPET = `// --- 全能网关适配器 (Universal Gateway Adapter) ---
+const RUST_CODE_SNIPPET = `// Hyperliquid 高频策略核心循环 (Rust)
 
-// 1. 定义通用交易所接口 (Trait)
-// 所有 DEX (Hyperliquid, dYdX, Uniswap) 必须实现此接口
-#[async_trait]
-pub trait ExchangeAdapter: Send + Sync {
-    async fn subscribe_orderbook(&self, symbol: &str) -> Result<Receiver<OrderBookUpdate>>;
-    async fn place_order(&self, order: Order) -> Result<OrderId>;
-    async fn cancel_order(&self, id: OrderId) -> Result<()>;
-    // 处理链上签名的通用方法
-    fn sign_payload(&self, payload: &[u8]) -> Signature; 
-}
+use tokio_tungstenite::connect_async;
+use serde_json::Value;
 
-// 2. 适配器实现：CLOB (订单簿) vs AMM (自动做市商)
-pub struct HyperliquidAdapter { /* ... */ } // CLOB: 高频挂单
-pub struct UniswapAdapter { /* ... */ }     // AMM: 需处理 Swap/Liquidity
+#[tokio::main]
+async fn main() {
+    // 1. 建立低延迟 WebSocket 连接
+    let (ws_stream, _) = connect_async("wss://api.hyperliquid.xyz/ws").await.unwrap();
+    let (mut write, mut read) = ws_stream.split();
 
-// 3. 策略引擎逻辑 (与具体交易所解耦)
-// 策略根本不知道自己在哪个交易所跑，它只针对 "抽象市场" 编程
-async fn run_strategy(exchange: Box<dyn ExchangeAdapter>) {
-    let mut rx = exchange.subscribe_orderbook("ETH-USD").await.unwrap();
-    
-    while let Some(update) = rx.recv().await {
-        let signal = strategy.calculate(update);
-        if let Some(order) = signal {
-            // 无论是 Hyperliquid 还是 dYdX，统一调用
-            exchange.place_order(order).await; 
+    // 2. 订阅 L2 订单簿 (只关注最近的档位以减少带宽)
+    let sub_msg = json!({ "method": "subscribe", "subscription": { "type": "l2Book", "coin": "ETH" } });
+    write.send(Message::Text(sub_msg.to_string())).await.unwrap();
+
+    // 3. 极速事件循环
+    while let Some(message) = read.next().await {
+        let data = parse_simd_json(message); // 使用 SIMD 加速解析
+        
+        // 4. 策略逻辑：Avellaneda-Stoikov 模型
+        let mid_price = (data.bids[0].px + data.asks[0].px) / 2.0;
+        let inventory = account.get_position("ETH");
+        
+        // 核心：计算保留价格 (Reservation Price)
+        // r = s - q * gamma * sigma^2
+        let reservation_price = mid_price - (inventory * RISK_AVERSION * VOLATILITY);
+        
+        let spread = calculate_optimal_spread(VOLATILITY);
+        
+        let my_bid = reservation_price - spread / 2.0;
+        let my_ask = reservation_price + spread / 2.0;
+
+        // 5. 差分下单 (只在价格变动超过阈值时修改订单，节省 API 限频)
+        if (my_bid - current_bid).abs() > TICK_SIZE {
+             api_client.post_orders(vec![
+                 Order { coin: "ETH", is_buy: true, sz: 1.0, limit_px: my_bid },
+                 Order { coin: "ETH", is_buy: false, sz: 1.0, limit_px: my_ask }
+             ]).await;
         }
     }
 }`;
+
+// --- Simulation Types ---
+
+interface SimState {
+    midPrice: number;
+    reservationPrice: number; // The bot's internal "fair value"
+    inventory: number;
+    cash: number;
+    myBid: number;
+    myAsk: number;
+}
+
+const INITIAL_PRICE = 1000;
+const INITIAL_CASH = 10000;
 
 // --- Main Application ---
 
 const App: React.FC = () => {
   const [activePhase, setActivePhase] = useState<Phase>(Phase.Theory);
   
-  // Simulation State
+  // Simulation Configuration
   const [simRunning, setSimRunning] = useState(false);
-  const [marketData, setMarketData] = useState<MarketState[]>([]);
-  const [currentPrice, setCurrentPrice] = useState(1000);
-  const [stats, setStats] = useState<SimulationStats>({ pnl: 0, trades: 0, volume: 0, latency: 45 });
-  const [inventory, setInventory] = useState(0);
+  const [riskAversion, setRiskAversion] = useState(0.1); // Gamma
+  const [volatility, setVolatility] = useState(0.5); // Sigma
+  const [latency, setLatency] = useState(20); // Simulated ms
   
-  const maxDataPoints = 50;
+  // Simulation State
+  const [simState, setSimState] = useState<SimState>({
+    midPrice: INITIAL_PRICE,
+    reservationPrice: INITIAL_PRICE,
+    inventory: 0,
+    cash: INITIAL_CASH,
+    myBid: 999.5,
+    myAsk: 1000.5
+  });
+  
+  const [marketData, setMarketData] = useState<any[]>([]);
+  const [stats, setStats] = useState<SimulationStats>({ pnl: 0, trades: 0, volume: 0, latency: 0 });
 
-  // Simulation Loop
+  // Advanced Stoikov Simulation Loop
   useEffect(() => {
     let interval: number | undefined;
 
     if (simRunning) {
       interval = window.setInterval(() => {
-        const time = Date.now();
-        
-        // Random Walk Price
-        const volatility = 0.8;
-        const change = (Math.random() - 0.5) * volatility;
-        const newPrice = Math.max(100, currentPrice + change);
-        
-        setCurrentPrice(newPrice);
-        
-        // Update Chart Data
-        setMarketData(prev => {
-          const newData = [...prev, { price: newPrice, timestamp: time }];
-          if (newData.length > maxDataPoints) newData.shift();
-          return newData;
-        });
+        setSimState(prev => {
+          const time = Date.now();
+          
+          // 1. Market Dynamics: Geometric Brownian Motion
+          const dt = 1/365/24/60/60; // small time step
+          const drift = 0;
+          const shock = (Math.random() - 0.5) * volatility * 2; // Simple volatility
+          const newMid = prev.midPrice + shock;
+          
+          // 2. Strategy: Calculate Reservation Price (r)
+          // r = s - q * gamma * sigma^2
+          // If inventory > 0, r < s (Skew quotes down to sell)
+          // If inventory < 0, r > s (Skew quotes up to buy)
+          const inventorySkew = prev.inventory * riskAversion * volatility * 5; // Multiplier for visual effect
+          const newReservation = newMid - inventorySkew;
+          
+          // 3. Calculate Optimal Quotes
+          const halfSpread = volatility * 0.8; // Simplified optimal spread
+          const newBid = newReservation - halfSpread;
+          const newAsk = newReservation + halfSpread;
+          
+          // 4. Matching Engine Simulation (Poisson Process)
+          // Probability of fill decays exponentially with distance from mid price
+          const probHitAsk = Math.exp(-1.5 * (newAsk - newMid)); // Ask hit if price moves up
+          const probHitBid = Math.exp(-1.5 * (newMid - newBid)); // Bid hit if price moves down
+          
+          let nextInv = prev.inventory;
+          let nextCash = prev.cash;
+          let tradeOccurred = false;
 
-        // Simulate MM Logic
-        // If price moves against inventory, lose money. If stable, make spread.
-        const spread = 0.05; // captured spread
-        const adverseSelection = Math.abs(change) > 0.3; // big move
-        
-        if (adverseSelection) {
-           // Inventory hurt by sharp move
-           setStats(s => ({
-             ...s,
-             pnl: s.pnl - (Math.abs(inventory) * Math.abs(change) * 5),
-             latency: Math.floor(Math.random() * 20) + 30 // latency jitter
-           }));
-           // Bot panic sells/buys to neutralize
-           setInventory(prev => prev * 0.5); 
-        } else {
-          // Capture spread
-          const tradeHappened = Math.random() > 0.6;
-          if (tradeHappened) {
-            const side = Math.random() > 0.5 ? 1 : -1;
-            setInventory(prev => {
-                const newInv = prev + side;
-                // If inventory gets too high, stop making markets on that side (simplified)
-                if (Math.abs(newInv) > 10) return prev; 
-                return newInv;
-            });
-            setStats(s => ({
-              ...s,
-              pnl: s.pnl + spread,
-              trades: s.trades + 1,
-              volume: s.volume + newPrice,
-              latency: Math.floor(Math.random() * 5) + 5 // fast execution
-            }));
+          // Simulate Ask Fill
+          if (Math.random() < probHitAsk * 0.3) { // 0.3 factor to slow down visual sim
+              nextInv -= 1;
+              nextCash += newAsk;
+              tradeOccurred = true;
           }
-        }
+          
+          // Simulate Bid Fill
+          if (Math.random() < probHitBid * 0.3) {
+              nextInv += 1;
+              nextCash -= newBid;
+              tradeOccurred = true;
+          }
 
-      }, 100); // 100ms ticks
+          // 5. Update Stats
+          const markToMarketVal = nextCash + (nextInv * newMid);
+          const pnl = markToMarketVal - INITIAL_CASH;
+          
+          if (tradeOccurred) {
+             setStats(s => ({
+                 ...s,
+                 trades: s.trades + 1,
+                 volume: s.volume + newMid,
+                 pnl: pnl
+             }));
+          }
+
+          // Update Chart Data
+          setMarketData(d => {
+             const newData = [...d, {
+                 timestamp: time,
+                 price: newMid,
+                 reservation: newReservation,
+                 bid: newBid,
+                 ask: newAsk,
+                 inventory: nextInv
+             }];
+             if (newData.length > 60) newData.shift();
+             return newData;
+          });
+
+          return {
+              midPrice: newMid,
+              reservationPrice: newReservation,
+              inventory: nextInv,
+              cash: nextCash,
+              myBid: newBid,
+              myAsk: newAsk
+          };
+        });
+      }, 50); // 50ms Tick
     }
-
     return () => clearInterval(interval);
-  }, [simRunning, currentPrice, inventory]);
-
+  }, [simRunning, riskAversion, volatility]);
 
   const renderContent = () => {
     switch (activePhase) {
@@ -206,65 +267,48 @@ const App: React.FC = () => {
         return (
           <div className="animate-fade-in">
             <div className="mb-8">
-              <div className="flex items-center space-x-3 mb-2">
-                <Globe className="text-hl-accent" size={32} />
-                <h1 className="text-3xl font-bold text-white">DEX 通用连接理论</h1>
-              </div>
-              <p className="text-gray-400">接入所有去中心化交易所的秘诀在于：<span className="text-white font-bold">抽象化 (Abstraction)</span>。虽然 Hyperliquid, dYdX, Uniswap 底层协议不同，但对量化机器人来说，它们只是数据的生产者和订单的消费者。</p>
+              <h1 className="text-3xl font-bold text-white mb-2">高频做市 (HFT Market Making)</h1>
+              <p className="text-gray-400">在毫秒级的战场上，理解微观结构比预测大趋势更重要。</p>
             </div>
             
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              <ContentCard title="交易所形态分类 (Taxonomy)">
-                <ul className="space-y-4">
-                  <li className="bg-hl-dark p-3 rounded border border-hl-border">
-                    <div className="flex items-center mb-1">
-                      <Layers className="text-hl-blue mr-2" size={16} />
-                      <strong className="text-white text-sm">CLOB (中央限价订单簿)</strong>
-                    </div>
-                    <p className="text-xs text-gray-400 mb-2">
-                      代表：<span className="text-hl-blue">Hyperliquid, dYdX, Vertex</span>
-                    </p>
-                    <p className="text-xs text-gray-500">
-                      逻辑最接近币安/纳斯达克。高频策略通过 <code className="text-hl-accent">limit order</code> 提供流动性。核心是速度和库存管理。
-                    </p>
+              <ContentCard title="做市商的核心任务">
+                <ul className="space-y-4 text-sm text-gray-300">
+                  <li className="flex items-start">
+                    <span className="text-hl-green mr-2">1.</span>
+                    <span><strong>提供流动性：</strong>在买一和卖一挂单，赚取点差 (Spread)。</span>
                   </li>
-                  <li className="bg-hl-dark p-3 rounded border border-hl-border">
-                    <div className="flex items-center mb-1">
-                      <RefreshCcw className="text-hl-green mr-2" size={16} />
-                      <strong className="text-white text-sm">AMM (自动做市商)</strong>
-                    </div>
-                    <p className="text-xs text-gray-400 mb-2">
-                      代表：<span className="text-hl-green">Uniswap, Curve, Raydium</span>
-                    </p>
-                    <p className="text-xs text-gray-500">
-                      没有买卖单，只有流动性池。策略变成 "JIT Liquidity" (即时流动性) 或 "Sandwich Attacks" (三明治攻击)。<span className="text-hl-red">传统 HFT 做市策略需大幅修改。</span>
-                    </p>
+                  <li className="flex items-start">
+                    <span className="text-hl-green mr-2">2.</span>
+                    <span><strong>库存管理 (核心)：</strong>你不是在赌方向。如果你积累了太多多头头寸，你必须降低卖单价格以尽快平仓。这叫 <span className="text-hl-accent">Inventory Skewing</span>。</span>
+                  </li>
+                  <li className="flex items-start">
+                    <span className="text-hl-green mr-2">3.</span>
+                    <span><strong>逆向选择 (Adverse Selection)：</strong>如果你的买单被“有毒流”(Toxic Flow) 吃掉，通常意味着价格即将暴跌。你必须比这种信息跑得更快。</span>
                   </li>
                 </ul>
               </ContentCard>
-              
-              <ContentCard title="全链连接挑战">
-                <div className="space-y-4">
-                  <div className="flex items-start space-x-4 bg-hl-blue/10 p-4 rounded-lg border border-hl-blue/20">
-                    <Network className="text-hl-blue shrink-0 mt-1" />
-                    <div>
-                      <h4 className="text-hl-blue font-bold mb-1 text-sm">RPC 节点瓶颈</h4>
-                      <p className="text-xs text-gray-300">
-                        不像 Hyperliquid 是专有 AppChain，连接 Uniswap 需要通过以太坊 RPC 节点。节点延迟通常在 50-200ms，这是 HFT 的噩梦。解决方案：运行自己的验证节点 (Validator Node)。
-                      </p>
+
+              <ContentCard title="订单簿微观结构">
+                 <div className="relative h-40 bg-[#0d0e11] rounded border border-hl-border flex items-center justify-center overflow-hidden">
+                    <div className="absolute w-full h-full flex">
+                        <div className="w-1/2 h-full flex flex-col items-end justify-center pr-4 border-r border-dashed border-gray-700">
+                            <div className="text-hl-green font-mono">Buy Orders</div>
+                            <div className="w-3/4 h-2 bg-hl-green/20 mt-1 rounded"></div>
+                            <div className="w-1/2 h-2 bg-hl-green/20 mt-1 rounded"></div>
+                            <div className="w-full h-2 bg-hl-green/20 mt-1 rounded"></div>
+                        </div>
+                        <div className="w-1/2 h-full flex flex-col items-start justify-center pl-4">
+                            <div className="text-hl-red font-mono">Sell Orders</div>
+                            <div className="w-2/3 h-2 bg-hl-red/20 mt-1 rounded"></div>
+                            <div className="w-1/2 h-2 bg-hl-red/20 mt-1 rounded"></div>
+                            <div className="w-full h-2 bg-hl-red/20 mt-1 rounded"></div>
+                        </div>
                     </div>
-                  </div>
-                  
-                  <div className="flex items-start space-x-4 bg-hl-accent/10 p-4 rounded-lg border border-hl-accent/20">
-                    <Lock className="text-hl-accent shrink-0 mt-1" />
-                    <div>
-                      <h4 className="text-hl-accent font-bold mb-1 text-sm">签名与 Gas 管理</h4>
-                      <p className="text-xs text-gray-300">
-                        每个 DEX 的签名算法不同 (EIP-712 vs Ed25519)。通用架构必须封装这些加密原语。同时，你必须监控不同链的 Gas 价格，防止 Gas 费吞噬利润。
-                      </p>
+                    <div className="z-10 bg-[#141519] px-4 py-2 rounded border border-hl-border text-xs font-mono">
+                        Spread (点差)
                     </div>
-                  </div>
-                </div>
+                 </div>
               </ContentCard>
             </div>
           </div>
@@ -274,8 +318,8 @@ const App: React.FC = () => {
         return (
           <div className="animate-fade-in">
             <div className="mb-8">
-              <h1 className="text-3xl font-bold text-white mb-2">阶段二：技术栈与极致优化</h1>
-              <p className="text-gray-400">在高频领域，每一微秒（µs）的延迟都决定了你是吃肉还是买单。</p>
+              <h1 className="text-3xl font-bold text-white mb-2">极致性能技术栈</h1>
+              <p className="text-gray-400">当竞争对手是 Jump Trading 和 Wintermute 时，Python 是不够的。</p>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
@@ -284,25 +328,25 @@ const App: React.FC = () => {
                   <Cpu size={100} />
                 </div>
                 <h3 className="text-xl font-bold text-hl-green mb-2">Rust</h3>
-                <div className="text-xs font-mono bg-hl-green/10 text-hl-green inline-block px-2 py-1 rounded mb-4">唯一推荐</div>
+                <div className="text-xs font-mono bg-hl-green/10 text-hl-green inline-block px-2 py-1 rounded mb-4">硬性要求</div>
                 <p className="text-sm text-gray-400">
-                  内存安全 + 零成本抽象。Tokio 异步运行时提供了完美的并发模型。没有 GC 暂停意味着没有意外亏损。
+                  无 GC (垃圾回收) 暂停。内存安全。现代金融系统的首选。Hyperliquid 的后端本身也是用 Rust 写的。
                 </p>
               </div>
 
               <div className="bg-hl-card border border-hl-border rounded-xl p-6 opacity-75">
                 <h3 className="text-xl font-bold text-white mb-2">C++</h3>
-                <div className="text-xs font-mono bg-gray-700 text-gray-300 inline-block px-2 py-1 rounded mb-4">传统之选</div>
+                <div className="text-xs font-mono bg-gray-700 text-gray-300 inline-block px-2 py-1 rounded mb-4">传统选择</div>
                 <p className="text-sm text-gray-400">
-                  HFT 的老牌王者。控制力极强，但内存管理复杂，容易出现 Segfault。维护成本高于 Rust。
+                  如果你有现成的 C++ 库可以使用。但对于新项目，Rust 的开发效率和安全性更高。
                 </p>
               </div>
               
               <div className="bg-hl-card border border-hl-red/30 rounded-xl p-6 opacity-60">
                 <h3 className="text-xl font-bold text-white mb-2">Python</h3>
-                <div className="text-xs font-mono bg-hl-red/10 text-hl-red inline-block px-2 py-1 rounded mb-4">仅限原型</div>
+                <div className="text-xs font-mono bg-hl-red/10 text-hl-red inline-block px-2 py-1 rounded mb-4">仅用于研究</div>
                 <p className="text-sm text-gray-400">
-                  解释型语言太慢了。仅用于数据分析、回测逻辑验证或 REST API 交互。绝不上生产环境。
+                  仅用于数据分析、回测和原型设计。由于 GIL 和解释器开销，无法处理微秒级做市。
                 </p>
               </div>
             </div>
@@ -310,32 +354,32 @@ const App: React.FC = () => {
             <ContentCard title="系统级调优 (System Tuning)">
                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                  <div className="bg-[#0d0e11] p-4 rounded border border-hl-border">
-                   <div className="flex items-center mb-2 text-hl-accent">
+                   <div className="flex items-center mb-2 text-hl-blue">
                       <Zap size={18} className="mr-2" />
                       <span className="font-bold text-sm">Kernel Bypass</span>
                    </div>
                    <p className="text-xs text-gray-400 leading-relaxed">
-                     使用 DPDK 或 Solarflare OpenOnload。绕过操作系统笨重的 TCP/IP 协议栈，让网卡直接与用户空间程序交换数据。
+                     使用 DPDK 或 Solarflare OpenOnload。绕过操作系统笨重的 TCP/IP 协议栈，直接从网卡读取数据包。
                    </p>
                  </div>
                  
                  <div className="bg-[#0d0e11] p-4 rounded border border-hl-border">
-                   <div className="flex items-center mb-2 text-hl-accent">
-                      <Lock size={18} className="mr-2" />
+                   <div className="flex items-center mb-2 text-hl-blue">
+                      <Cpu size={18} className="mr-2" />
                       <span className="font-bold text-sm">CPU Isolation</span>
                    </div>
                    <p className="text-xs text-gray-400 leading-relaxed">
-                     使用 <code className="bg-gray-800 px-1 rounded">isolcpus</code> 和 <code className="bg-gray-800 px-1 rounded">taskset</code>。将策略线程“钉”在特定物理核心上，独占 L1/L2 缓存，杜绝上下文切换。
+                     使用 <code className="bg-gray-800 px-1 rounded">isolcpus</code>。将策略线程“钉”在特定物理核心上，独占 L1/L2 缓存，防止上下文切换。
                    </p>
                  </div>
 
                  <div className="bg-[#0d0e11] p-4 rounded border border-hl-border">
-                   <div className="flex items-center mb-2 text-hl-accent">
+                   <div className="flex items-center mb-2 text-hl-blue">
                       <Code size={18} className="mr-2" />
-                      <span className="font-bold text-sm">SIMD Parsing</span>
+                      <span className="font-bold text-sm">SIMD JSON</span>
                    </div>
                    <p className="text-xs text-gray-400 leading-relaxed">
-                     使用 <code className="bg-gray-800 px-1 rounded">simd-json</code>。利用 CPU 的 AVX2/AVX-512 指令集并行解析 JSON 数据，比标准库快 2-3 倍。
+                     使用 <code className="bg-gray-800 px-1 rounded">simd-json</code>。利用 CPU 的 AVX2 指令集并行解析 JSON 数据，解析速度提升 300%。
                    </p>
                  </div>
                </div>
@@ -347,8 +391,8 @@ const App: React.FC = () => {
         return (
           <div className="animate-fade-in h-full flex flex-col">
             <div className="mb-6">
-              <h1 className="text-3xl font-bold text-white mb-2">通用网关架构 (Gateway Pattern)</h1>
-              <p className="text-gray-400">如何用一套代码控制所有交易所？答案是：适配器模式。</p>
+              <h1 className="text-3xl font-bold text-white mb-2">核心代码架构</h1>
+              <p className="text-gray-400">基于 Toko 的异步事件驱动架构。</p>
             </div>
 
             <div className="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -356,31 +400,16 @@ const App: React.FC = () => {
                 <CodeBlock code={RUST_CODE_SNIPPET} />
               </div>
               <div className="space-y-4">
-                <div className="p-4 bg-hl-card border-l-2 border-hl-blue rounded-r-lg">
-                  <div className="flex items-center mb-2 text-hl-blue">
-                    <Workflow size={18} className="mr-2" />
-                    <h4 className="font-bold text-sm">策略解耦 (Decoupling)</h4>
-                  </div>
-                  <p className="text-xs text-gray-400">
-                    策略层不应包含 <code className="font-mono">if exchange == "binance"</code> 这样的代码。所有差异化逻辑（API 端点、签名格式）都封装在 Adapter 中。
-                  </p>
-                </div>
-                <div className="p-4 bg-hl-card border-l-2 border-hl-accent rounded-r-lg">
-                  <div className="flex items-center mb-2 text-hl-accent">
-                    <Globe size={18} className="mr-2" />
-                    <h4 className="font-bold text-sm">多链支持</h4>
-                  </div>
-                  <p className="text-xs text-gray-400">
-                    适配器还需管理不同链的 RPC 连接。例如 Solana 的适配器需要连接 gRPC 节点，而 Arbitrum 适配器连接 Websocket 节点。
-                  </p>
-                </div>
                 <div className="p-4 bg-hl-card border-l-2 border-hl-green rounded-r-lg">
-                  <div className="flex items-center mb-2 text-hl-green">
-                    <Layers size={18} className="mr-2" />
-                    <h4 className="font-bold text-sm">统一数据模型</h4>
-                  </div>
+                  <h4 className="font-bold text-sm text-hl-green mb-1">事件循环 (Event Loop)</h4>
                   <p className="text-xs text-gray-400">
-                    所有适配器必须将交易所原始的 JSON 数据转换为内部统一的 <code className="font-mono">NormalizedOrderBook</code> 结构体。
+                    必须是单线程无锁的 (Single-threaded Lock-free)。锁 (Mutex) 会导致线程争用，引入不可控的延迟抖动。
+                  </p>
+                </div>
+                <div className="p-4 bg-hl-card border-l-2 border-hl-blue rounded-r-lg">
+                  <h4 className="font-bold text-sm text-hl-blue mb-1">状态管理</h4>
+                  <p className="text-xs text-gray-400">
+                    在本地内存中完整重建订单簿 (Local Orderbook)。不要每次下单都去查询 API，直接使用本地状态计算。
                   </p>
                 </div>
               </div>
@@ -393,16 +422,13 @@ const App: React.FC = () => {
           <div className="animate-fade-in h-full flex flex-col">
             <div className="flex justify-between items-center mb-6">
               <div>
-                <h1 className="text-3xl font-bold text-white mb-1">策略模拟器</h1>
-                <p className="text-gray-400 text-sm">可视化：库存风险与点差捕捉模型</p>
+                <h1 className="text-3xl font-bold text-white mb-1">Stoikov 策略模拟器</h1>
+                <p className="text-gray-400 text-sm">深度观察：库存如何偏移保留价格 (Reservation Price)</p>
               </div>
               <div className="flex items-center space-x-4">
                  <div className="flex flex-col items-end mr-4">
-                    <span className={`text-xs font-mono ${stats.pnl >= 0 ? 'text-hl-green' : 'text-hl-red'}`}>
-                      盈亏: ${stats.pnl.toFixed(2)}
-                    </span>
-                    <span className="text-xs text-gray-500 font-mono">
-                      延迟: {stats.latency}ms
+                    <span className={`text-sm font-mono font-bold ${stats.pnl >= 0 ? 'text-hl-green' : 'text-hl-red'}`}>
+                      PnL: ${stats.pnl.toFixed(2)}
                     </span>
                  </div>
                 <button 
@@ -417,10 +443,9 @@ const App: React.FC = () => {
                 </button>
                 <button 
                   onClick={() => {
-                    setStats({ pnl: 0, trades: 0, volume: 0, latency: 45 });
+                    setStats({ pnl: 0, trades: 0, volume: 0, latency: 0 });
+                    setSimState({ midPrice: INITIAL_PRICE, reservationPrice: INITIAL_PRICE, inventory: 0, cash: INITIAL_CASH, myBid: 999.5, myAsk: 1000.5 });
                     setMarketData([]);
-                    setInventory(0);
-                    setCurrentPrice(1000);
                   }}
                   className="p-2 rounded-full bg-hl-card text-gray-400 hover:text-white border border-hl-border"
                 >
@@ -430,13 +455,16 @@ const App: React.FC = () => {
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 flex-1 min-h-[400px]">
-              {/* Chart Area */}
-              <div className="lg:col-span-2 bg-[#0d0e11] border border-hl-border rounded-xl p-4 flex flex-col">
-                <h3 className="text-sm font-bold text-gray-400 mb-4 flex justify-between">
-                  <span>市场微观结构</span>
-                  <span className="font-mono text-white">${currentPrice.toFixed(2)}</span>
-                </h3>
-                <div className="flex-1 w-full h-full min-h-[300px]">
+              {/* Main Chart */}
+              <div className="lg:col-span-2 bg-[#0d0e11] border border-hl-border rounded-xl p-4 flex flex-col relative">
+                <div className="absolute top-4 left-4 z-10 flex space-x-4 text-xs">
+                    <div className="flex items-center"><div className="w-3 h-1 bg-hl-blue mr-2"></div>Mid Price (中间价)</div>
+                    <div className="flex items-center"><div className="w-3 h-1 bg-hl-accent mr-2"></div>Reservation Price (保留价)</div>
+                    <div className="flex items-center"><div className="w-3 h-1 bg-hl-green mr-2"></div>My Bid</div>
+                    <div className="flex items-center"><div className="w-3 h-1 bg-hl-red mr-2"></div>My Ask</div>
+                </div>
+
+                <div className="flex-1 w-full h-full min-h-[300px] mt-6">
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={marketData}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
@@ -444,85 +472,238 @@ const App: React.FC = () => {
                       <YAxis domain={['auto', 'auto']} orientation="right" stroke="#4b5563" tick={{fontSize: 12}} />
                       <Tooltip 
                         contentStyle={{ backgroundColor: '#141519', borderColor: '#2a2d35', color: '#fff' }}
-                        itemStyle={{ color: '#fff' }}
                         labelStyle={{ display: 'none' }}
+                        formatter={(value: any) => parseFloat(value).toFixed(2)}
                       />
-                      <ReferenceLine y={currentPrice} stroke="#3b82f6" strokeDasharray="3 3" opacity={0.5} />
-                      {/* Bot's Orders Visualized around price */}
-                      {simRunning && (
-                        <>
-                           <ReferenceLine y={currentPrice * 1.0005} stroke="#f6465d" strokeOpacity={0.3} label={{position: 'insideRight', value: '卖单', fill: '#f6465d', fontSize: 10}} />
-                           <ReferenceLine y={currentPrice * 0.9995} stroke="#2ebd85" strokeOpacity={0.3} label={{position: 'insideRight', value: '买单', fill: '#2ebd85', fontSize: 10}} />
-                        </>
-                      )}
-                      <Line 
-                        type="monotone" 
-                        dataKey="price" 
-                        stroke="#8b5cf6" 
-                        strokeWidth={2} 
-                        dot={false} 
-                        animationDuration={300}
-                      />
+                      {/* Market Mid Price */}
+                      <Line type="monotone" dataKey="price" stroke="#3b82f6" strokeWidth={2} dot={false} />
+                      
+                      {/* Strategy Reservation Price - The "Soul" of the bot */}
+                      <Line type="step" dataKey="reservation" stroke="#8b5cf6" strokeWidth={2} strokeDasharray="5 5" dot={false} />
+                      
+                      {/* Quotes */}
+                      <Line type="step" dataKey="bid" stroke="#2ebd85" strokeWidth={1} dot={false} opacity={0.6} />
+                      <Line type="step" dataKey="ask" stroke="#f6465d" strokeWidth={1} dot={false} opacity={0.6} />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
               </div>
 
-              {/* Order Book & Stats */}
+              {/* Control Panel & Internal State */}
               <div className="space-y-6">
-                {/* Live Book Visualization */}
-                <div className="bg-hl-card border border-hl-border rounded-xl p-4 overflow-hidden">
-                   <h4 className="text-xs font-bold text-gray-500 mb-3 uppercase tracking-wider">实时本地订单簿</h4>
-                   <div className="space-y-1 font-mono text-sm">
-                      {/* Asks */}
-                      {[4, 3, 2, 1].map(i => (
-                        <div key={`ask-${i}`} className="flex justify-between text-hl-red relative group cursor-pointer hover:bg-hl-red/5 px-1">
-                           <span className="z-10 relative">{(currentPrice + (i * 0.05)).toFixed(2)}</span>
-                           <span className="z-10 relative text-gray-500">{(Math.random() * 1000).toFixed(0)}</span>
-                           <div className="absolute right-0 top-0 bottom-0 bg-hl-red/10" style={{width: `${Math.random() * 60}%`}}></div>
-                           {i === 1 && simRunning && <div className="absolute left-[-10px] text-hl-accent text-[10px] flex items-center">你的挂单</div>}
+                {/* Parameters */}
+                <div className="bg-hl-card border border-hl-border rounded-xl p-4">
+                    <h4 className="text-xs font-bold text-gray-500 mb-4 uppercase flex items-center">
+                        <Settings size={14} className="mr-2" /> 策略参数 (Strategy Params)
+                    </h4>
+                    
+                    <div className="space-y-4">
+                        <div>
+                            <div className="flex justify-between text-xs mb-1">
+                                <span className="text-gray-400">Inventory Aversion (γ)</span>
+                                <span className="text-white font-mono">{riskAversion.toFixed(2)}</span>
+                            </div>
+                            <input 
+                                type="range" min="0.01" max="0.5" step="0.01"
+                                value={riskAversion}
+                                onChange={(e) => setRiskAversion(parseFloat(e.target.value))}
+                                className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-hl-accent"
+                            />
+                            <p className="text-[10px] text-gray-500 mt-1">值越大，库存稍微偏离 0 就会大幅调整报价。</p>
                         </div>
-                      ))}
-                      
-                      <div className="py-1 text-center text-lg font-bold text-white bg-[#0d0e11] my-2 border-y border-hl-border">
-                        {currentPrice.toFixed(2)}
-                      </div>
+                        
+                        <div>
+                            <div className="flex justify-between text-xs mb-1">
+                                <span className="text-gray-400">Market Volatility (σ)</span>
+                                <span className="text-white font-mono">{volatility.toFixed(2)}</span>
+                            </div>
+                            <input 
+                                type="range" min="0.1" max="2.0" step="0.1"
+                                value={volatility}
+                                onChange={(e) => setVolatility(parseFloat(e.target.value))}
+                                className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-hl-blue"
+                            />
+                            <p className="text-[10px] text-gray-500 mt-1">波动率越大，点差越宽。</p>
+                        </div>
+                    </div>
+                </div>
 
-                      {/* Bids */}
-                      {[1, 2, 3, 4].map(i => (
-                        <div key={`bid-${i}`} className="flex justify-between text-hl-green relative group cursor-pointer hover:bg-hl-green/5 px-1">
-                           <span className="z-10 relative">{(currentPrice - (i * 0.05)).toFixed(2)}</span>
-                           <span className="z-10 relative text-gray-500">{(Math.random() * 1000).toFixed(0)}</span>
-                           <div className="absolute right-0 top-0 bottom-0 bg-hl-green/10" style={{width: `${Math.random() * 60}%`}}></div>
-                           {i === 1 && simRunning && <div className="absolute left-[-10px] text-hl-accent text-[10px] flex items-center">你的挂单</div>}
-                        </div>
-                      ))}
+                {/* Live Internals Visualizer */}
+                <div className="bg-hl-card border border-hl-border rounded-xl p-4">
+                   <h4 className="text-xs font-bold text-gray-500 mb-3 uppercase flex items-center">
+                       <Activity size={14} className="mr-2" /> 内部状态 (Internals)
+                   </h4>
+                   
+                   <div className="grid grid-cols-2 gap-4 mb-4">
+                       <div className="bg-[#0d0e11] p-2 rounded border border-hl-border text-center">
+                           <div className="text-[10px] text-gray-500">Inventory</div>
+                           <div className={`text-lg font-mono font-bold ${simState.inventory === 0 ? 'text-gray-300' : simState.inventory > 0 ? 'text-hl-green' : 'text-hl-red'}`}>
+                               {simState.inventory}
+                           </div>
+                       </div>
+                       <div className="bg-[#0d0e11] p-2 rounded border border-hl-border text-center">
+                           <div className="text-[10px] text-gray-500">Skew</div>
+                           <div className="text-lg font-mono font-bold text-hl-accent">
+                               {(simState.reservationPrice - simState.midPrice).toFixed(2)}
+                           </div>
+                       </div>
+                   </div>
+
+                   <div className="space-y-2 text-xs font-mono">
+                       <div className="flex justify-between">
+                           <span className="text-hl-red">My Ask</span>
+                           <span>{simState.myAsk.toFixed(2)}</span>
+                       </div>
+                       <div className="flex justify-between font-bold">
+                           <span className="text-hl-accent">Reservation</span>
+                           <span>{simState.reservationPrice.toFixed(2)}</span>
+                       </div>
+                       <div className="flex justify-between text-gray-500">
+                           <span>Mid Price</span>
+                           <span>{simState.midPrice.toFixed(2)}</span>
+                       </div>
+                       <div className="flex justify-between">
+                           <span className="text-hl-green">My Bid</span>
+                           <span>{simState.myBid.toFixed(2)}</span>
+                       </div>
                    </div>
                 </div>
+              </div>
+            </div>
+          </div>
+        );
+        
+      case Phase.Reality:
+        return (
+          <div className="animate-fade-in">
+             <div className="mb-8">
+              <h1 className="text-3xl font-bold text-white mb-2">阶段五：基础设施与实战</h1>
+              <p className="text-gray-400">当你拥有了完美的策略代码，接下来就是“拼硬件”。</p>
+            </div>
 
-                {/* Inventory Widget */}
-                <div className="bg-hl-card border border-hl-border rounded-xl p-4">
-                  <h4 className="text-xs font-bold text-gray-500 mb-3 uppercase tracking-wider">库存风险 (Inventory Risk)</h4>
-                  <div className="relative h-4 bg-[#0d0e11] rounded-full overflow-hidden border border-hl-border">
-                     <div className="absolute left-1/2 top-0 bottom-0 w-0.5 bg-gray-600"></div>
-                     <div 
-                        className={`absolute top-0 bottom-0 transition-all duration-300 ${inventory > 0 ? 'bg-hl-green left-1/2' : 'bg-hl-red right-1/2'}`}
-                        style={{ width: `${Math.min(Math.abs(inventory) * 5, 50)}%` }}
-                     ></div>
-                  </div>
-                  <div className="flex justify-between mt-2 text-xs font-mono">
-                    <span className="text-hl-red">-100 ETH</span>
-                    <span className="text-white">{inventory > 0 ? '+' : ''}{inventory} ETH</span>
-                    <span className="text-hl-green">+100 ETH</span>
-                  </div>
-                  <div className="mt-2 text-[10px] text-gray-500 text-center">
-                    目标: Delta Neutral (0)
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-2">
-                    <div className="bg-hl-card p-3 rounded border border-hl-border">
-                        <div className="text-gray-500 text-xs">交易次数</div>
-                        <div className="text-white font-mono">{stats.trades}</div>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+                {[
+                    { icon: Server, title: "裸金属服务器", cost: "$800+/月", desc: "独占 CPU 资源，无虚拟化噪音。" },
+                    { icon: Network, title: "主机托管 (Colo)", cost: "$5000+/月", desc: "服务器放在交易所机房隔壁，光纤直连。" },
+                    { icon: BarChart3, title: "L3 数据源", cost: "$2000+/月", desc: "购买逐笔成交数据用于回测。" },
+                    { icon: DollarSign, title: "最低资金", cost: "$10,000+", desc: "HFT 需要一定的资本厚度来承受回撤。" },
+                ].map((item, idx) => (
+                    <div key={idx} className="bg-hl-card border border-hl-border p-6 rounded-xl flex flex-col items-center text-center hover:border-hl-green/50 transition-colors">
+                        <item.icon className="text-hl-green mb-4" size={32} />
+                        <h3 className="text-white font-bold mb-1">{item.title}</h3>
+                        <div className="text-hl-green font-mono text-sm mb-2">{item.cost}</div>
+                        <p className="text-gray-500 text-xs">{item.desc}</p>
                     </div>
-                     <div className="bg-hl-card
+                ))}
+            </div>
+
+            <ContentCard title="为什么散户几乎不可能成功？">
+                <div className="space-y-4">
+                  <div className="flex items-start space-x-4 bg-hl-red/10 p-4 rounded-lg border border-hl-red/20">
+                    <AlertTriangle className="text-hl-red shrink-0 mt-1" />
+                    <div>
+                      <h4 className="text-hl-red font-bold mb-1 text-sm">延迟的马太效应</h4>
+                      <p className="text-xs text-gray-300">
+                        这是一个“赢家通吃”的游戏。如果你比竞争对手慢 1 毫秒，你永远抢不到好的单子，却总是会接到“有毒”的单子（即别人知道价格要变了，赶紧卖给你，你还没反应过来）。
+                      </p>
+                    </div>
+                  </div>
+                  
+                  <p className="text-sm text-gray-400 leading-relaxed">
+                    即使在 Hyperliquid 这样的高性能 DEX，你也面临着与 Wintermute、Jump 等顶级做市商的竞争。他们拥有更低的费率等级（Maker Rebates），这不仅是成本优势，更是生存优势。
+                  </p>
+                </div>
+            </ContentCard>
+          </div>
+        );
+        
+      default:
+        return <div className="text-gray-500">模块建设中...</div>;
+    }
+  };
+
+  return (
+    <div className="flex h-screen bg-[#0a0b0d] text-gray-300 font-sans selection:bg-hl-green selection:text-white">
+      {/* Sidebar */}
+      <div className="w-64 bg-[#141519] border-r border-hl-border flex flex-col shrink-0">
+        <div className="p-6 flex items-center border-b border-hl-border">
+          <div className="bg-hl-green/20 p-2 rounded-lg mr-3">
+            <Activity className="text-hl-green" size={24} />
+          </div>
+          <div>
+            <h1 className="text-white font-bold tracking-tight">HFT Master</h1>
+            <div className="text-[10px] text-gray-500 uppercase tracking-widest">Hyperliquid 做市指南</div>
+          </div>
+        </div>
+
+        <nav className="flex-1 p-4 overflow-y-auto">
+          <div className="text-xs font-bold text-gray-600 uppercase tracking-wider mb-4 px-3">课程大纲</div>
+          <NavItem 
+            active={activePhase === Phase.Theory} 
+            onClick={() => setActivePhase(Phase.Theory)} 
+            icon={BookOpen} 
+            label="1. 核心概念" 
+            phase={Phase.Theory}
+          />
+           <NavItem 
+            active={activePhase === Phase.Stack} 
+            onClick={() => setActivePhase(Phase.Stack)} 
+            icon={Layers} 
+            label="2. 技术栈选型" 
+            phase={Phase.Stack}
+          />
+          <NavItem 
+            active={activePhase === Phase.Code} 
+            onClick={() => setActivePhase(Phase.Code)} 
+            icon={Code} 
+            label="3. 代码架构" 
+            phase={Phase.Code}
+          />
+          
+          <div className="my-4 border-t border-hl-border"></div>
+          
+          <div className="text-xs font-bold text-gray-600 uppercase tracking-wider mb-4 px-3">实验室</div>
+          <NavItem 
+            active={activePhase === Phase.Simulation} 
+            onClick={() => setActivePhase(Phase.Simulation)} 
+            icon={Terminal} 
+            label="策略模拟器" 
+            phase={Phase.Simulation}
+          />
+          
+          <div className="my-4 border-t border-hl-border"></div>
+          
+          <NavItem 
+            active={activePhase === Phase.Reality} 
+            onClick={() => setActivePhase(Phase.Reality)} 
+            icon={AlertTriangle} 
+            label="实战与成本" 
+            phase={Phase.Reality}
+          />
+        </nav>
+
+        <div className="p-4 border-t border-hl-border bg-[#0d0e11]">
+          <div className="flex items-center text-xs text-gray-500">
+            <div className="w-2 h-2 rounded-full bg-hl-green mr-2 animate-pulse"></div>
+            Hyperliquid Mainnet
+          </div>
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <main className="flex-1 overflow-y-auto bg-[#0a0b0d] p-8 relative">
+        {/* Dynamic Background Mesh */}
+        <div className="absolute inset-0 overflow-hidden pointer-events-none opacity-20">
+           <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-hl-green/20 rounded-full blur-[128px]"></div>
+           <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-hl-blue/10 rounded-full blur-[128px]"></div>
+        </div>
+        
+        <div className="relative z-10 max-w-6xl mx-auto h-full flex flex-col">
+          {renderContent()}
+        </div>
+      </main>
+    </div>
+  );
+};
+
+export default App;
